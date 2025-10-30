@@ -9,10 +9,10 @@ urlpatterns = [
     path('users/login/', views.MyTokenObtainPairView.as_view(), name='token_obtain_pair'),
     path('users/token/refresh/', TokenRefreshView.as_view(), name='token_refresh'),
 
-    # Profiles / donors
+    # Profiles & donors
     path('donors/', views.donors_list, name='donors-list'),
-    path('profiles/<int:pk>/', views.profile_detail, name='profile-detail'),
-    path('profiles/update/', views.update_profile, name='profile-update'),
+    path('profile/<int:pk>/', views.profile_detail, name='profile-detail'),
+    path('profile/update/', views.update_profile, name='profile-update'),
 
     # Requests
     path('requests/send/<int:donor_id>/', views.send_request, name='send-request'),
@@ -20,6 +20,6 @@ urlpatterns = [
     path('requests/respond/<int:request_id>/', views.respond_request, name='respond-request'),
     path('requests/patient/', views.patient_requests, name='patient-requests'),
 
-    # Admin stats
+    # Admin
     path('admin/stats/', views.admin_stats, name='admin-stats'),
 ]

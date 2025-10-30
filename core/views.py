@@ -1,185 +1,275 @@
-# core/views.py
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, parser_classes
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from rest_framework.response import Response
-from rest_framework import status, generics
+from rest_framework import status
 from django.contrib.auth.models import User
 from .models import Profile, BloodRequest
-from .serializers import ProfileSerializer, RegisterSerializer, BloodRequestSerializer, UserSerializer
+from .serializers import (
+    ProfileSerializer,
+    RegisterSerializer,
+    BloodRequestSerializer,
+    UserSerializer,
+)
 from rest_framework_simplejwt.views import TokenObtainPairView
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework.permissions import IsAuthenticated, AllowAny
-from django.db.models import Q
-from .permissions import IsDonor, IsPatient, IsAdmin
+from django.shortcuts import get_object_or_404
+from django.db import IntegrityError
+from rest_framework_simplejwt.tokens import RefreshToken
 from django.utils import timezone
 
-# Custom Token serializer to add user info in response
+
+# ---------------------------
+# JWT Token View
+# ---------------------------
 class MyTokenObtainPairSerializer(TokenObtainPairSerializer):
     @classmethod
     def get_token(cls, user):
         token = super().get_token(user)
-        # add custom claims if you want
-        token['email'] = user.email
+        token["email"] = user.email
         return token
 
     def validate(self, attrs):
         data = super().validate(attrs)
-        data['user'] = UserSerializer(self.user).data
+        user_data = UserSerializer(self.user).data
+        try:
+            profile_data = ProfileSerializer(
+                self.user.profile, context={"request": self.context.get("request")}
+            ).data
+        except Exception:
+            profile_data = None
+        user_data["profile"] = profile_data
+        data["user"] = user_data
         return data
+
 
 class MyTokenObtainPairView(TokenObtainPairView):
     serializer_class = MyTokenObtainPairSerializer
 
-@api_view(['POST'])
+
+# ---------------------------
+# Register new user
+# ---------------------------
+@api_view(["POST"])
 @permission_classes([AllowAny])
+@parser_classes([MultiPartParser, FormParser, JSONParser])
 def register_view(request):
     serializer = RegisterSerializer(data=request.data)
     if serializer.is_valid():
-        user = serializer.save()
-        # Return JWT tokens for convenience (create using simplejwt)
-        from rest_framework_simplejwt.tokens import RefreshToken
+        try:
+            user = serializer.save()
+        except IntegrityError:
+            return Response(
+                {"detail": "User with this email already exists."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         refresh = RefreshToken.for_user(user)
         user_data = UserSerializer(user).data
-        return Response({
-            'user': user_data,
-            'access': str(refresh.access_token),
-            'refresh': str(refresh),
-        }, status=status.HTTP_201_CREATED)
+        try:
+            profile_data = ProfileSerializer(
+                user.profile, context={"request": request}
+            ).data
+        except Exception:
+            profile_data = None
+        user_data["profile"] = profile_data
+
+        return Response(
+            {
+                "user": user_data,
+                "access": str(refresh.access_token),
+                "refresh": str(refresh),
+            },
+            status=status.HTTP_201_CREATED,
+        )
     return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-# list donors (public)
-@api_view(['GET'])
+
+# ---------------------------
+# Donor list & profiles
+# ---------------------------
+@api_view(["GET"])
 def donors_list(request):
-    qs = Profile.objects.filter(role='donor')
-    # Filters: blood_group, city, available (can_donate_now)
-    blood = request.GET.get('blood')
-    city = request.GET.get('city')
-    available = request.GET.get('available')
+    qs = Profile.objects.filter(role="donor")
+    blood = request.GET.get("blood")
+    city = request.GET.get("city")
+    available = request.GET.get("available")
+
     if blood:
         qs = qs.filter(blood_group__iexact=blood)
     if city:
         qs = qs.filter(city__icontains=city)
-    if available == 'true':
+    if available == "true":
         qs = [p for p in qs if p.can_donate_now()]
-        serializer = ProfileSerializer(qs, many=True)
+        serializer = ProfileSerializer(qs, many=True, context={"request": request})
         return Response(serializer.data)
-    serializer = ProfileSerializer(qs, many=True)
+
+    serializer = ProfileSerializer(qs, many=True, context={"request": request})
     return Response(serializer.data)
 
-@api_view(['GET'])
+
+@api_view(["GET"])
 def profile_detail(request, pk):
     try:
-        p = Profile.objects.get(id=pk)
-        return Response(ProfileSerializer(p).data)
+        profile = Profile.objects.get(id=pk)
+        return Response(ProfileSerializer(profile, context={"request": request}).data)
     except Profile.DoesNotExist:
-        return Response({'detail':'Not found'}, status=status.HTTP_404_NOT_FOUND)
+        return Response({"detail": "Not found"}, status=status.HTTP_404_NOT_FOUND)
 
-# Update profile (donor can update own)
-@api_view(['PUT'])
+
+@api_view(["PUT"])
 @permission_classes([IsAuthenticated])
+@parser_classes([MultiPartParser, FormParser, JSONParser])
 def update_profile(request):
     user = request.user
-    profile = user.profile
-    data = request.data
-    # Only allowed fields:
-    for field in ['name','blood_group','city','bio','ever_donated','last_donation']:
-        if field in data:
-            setattr(profile, field, data[field])
-    profile.save()
-    return Response(ProfileSerializer(profile).data)
-
-# Patient sends request to a donor
-@api_view(['POST'])
-@permission_classes([IsAuthenticated, IsPatient])
-def send_request(request, donor_id):
-    donor_user = None
     try:
-        donor_profile = Profile.objects.get(id=donor_id)
-        if donor_profile.role != 'donor':
-            return Response({'detail':'User is not a donor'}, status=status.HTTP_400_BAD_REQUEST)
-        donor_user = donor_profile.user
+        profile = user.profile
     except Profile.DoesNotExist:
-        return Response({'detail':'Donor not found'}, status=status.HTTP_404_NOT_FOUND)
+        return Response(
+            {"detail": "Profile not found for user"}, status=status.HTTP_404_NOT_FOUND
+        )
 
-    requester = request.user
+    data = request.data
+    for field in [
+        "name",
+        "blood_group",
+        "city",
+        "bio",
+        "ever_donated",
+        "last_donation",
+    ]:
+        if field in data:
+            val = data[field]
+            if field == "ever_donated" and isinstance(val, str):
+                val = val.lower() in ("1", "true", "yes")
+            setattr(profile, field, val)
 
-    # Check blood group match
-    if requester.profile.blood_group != donor_profile.blood_group:
-        return Response({'detail': 'Blood group must match'}, status=status.HTTP_400_BAD_REQUEST)
+    if "photo" in request.FILES:
+        profile.photo = request.FILES["photo"]
 
-    # Check donor availability (must have can_donate_now True)
-    if not donor_profile.can_donate_now():
-        nd = donor_profile.next_possible_donation_date()
-        return Response({'detail': f"Donor not available until {nd.isoformat()}"}, status=status.HTTP_400_BAD_REQUEST)
+    profile.save()
+    return Response(ProfileSerializer(profile, context={"request": request}).data)
 
-    # Prevent duplicate pending requests from same requester to same donor
-    existing = BloodRequest.objects.filter(requester=requester, donor=donor_user, status='pending')
-    if existing.exists():
-        return Response({'detail':'You already have a pending request to this donor'}, status=status.HTTP_400_BAD_REQUEST)
 
-    message = request.data.get('message','')
-    br = BloodRequest.objects.create(requester=requester, donor=donor_user, message=message)
-    return Response(BloodRequestSerializer(br).data, status=status.HTTP_201_CREATED)
+# ---------------------------
+# Blood Requests (Patient ↔ Donor)
+# ---------------------------
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def send_request(request, donor_id):
+    """
+    Patient sends blood request to a donor.
+    """
+    message = request.data.get("message", "")
+    donor_profile = get_object_or_404(Profile, id=donor_id, role="donor")
+    donor_user = donor_profile.user
 
-# Donor sees incoming requests
-@api_view(['GET'])
-@permission_classes([IsAuthenticated, IsDonor])
+    if request.user == donor_user:
+        return Response(
+            {"detail": "You cannot send request to yourself."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    blood_request = BloodRequest.objects.create(
+        requester=request.user, donor=donor_user, message=message
+    )
+    return Response(
+        BloodRequestSerializer(blood_request, context={"request": request}).data,
+        status=status.HTTP_201_CREATED,
+    )
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def donor_requests(request):
-    donor_user = request.user
-    qs = BloodRequest.objects.filter(donor=donor_user).order_by('-requested_at')
-    return Response(BloodRequestSerializer(qs, many=True).data)
-
-# Donor accepts/rejects a request
-@api_view(['POST'])
-@permission_classes([IsAuthenticated, IsDonor])
-def respond_request(request, request_id):
-    action = request.data.get('action')  # 'accept' or 'reject'
+    """
+    Donor views all incoming requests
+    """
+    user = request.user
     try:
-        br = BloodRequest.objects.get(id=request_id, donor=request.user)
-    except BloodRequest.DoesNotExist:
-        return Response({'detail':'Request not found'}, status=status.HTTP_404_NOT_FOUND)
-    if br.status != 'pending':
-        return Response({'detail':'Request already responded'}, status=status.HTTP_400_BAD_REQUEST)
+        profile = user.profile
+    except Profile.DoesNotExist:
+        return Response({"detail": "Profile not found"}, status=status.HTTP_404_NOT_FOUND)
 
-    if action == 'accept':
-        br.status = 'accepted'
-        br.responded_at = timezone.now()
-        br.save()
-        # When donor accepts and gives blood now -> update donor profile last_donation to today
-        donor_profile = br.donor.profile
-        donor_profile.ever_donated = True
-        donor_profile.last_donation = timezone.now().date()
-        donor_profile.save()
-        return Response(BloodRequestSerializer(br).data)
-    elif action == 'reject':
-        br.status = 'rejected'
-        br.responded_at = timezone.now()
-        br.save()
-        return Response(BloodRequestSerializer(br).data)
-    else:
-        return Response({'detail':'Invalid action'}, status=status.HTTP_400_BAD_REQUEST)
+    if profile.role != "donor":
+        return Response(
+            {"detail": "Only donors can access this endpoint."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
 
-# Patient list their requests
-@api_view(['GET'])
-@permission_classes([IsAuthenticated, IsPatient])
+    qs = BloodRequest.objects.filter(donor=user).order_by("-requested_at")
+    serializer = BloodRequestSerializer(qs, many=True, context={"request": request})
+    return Response(serializer.data)
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def respond_request(request, request_id):
+    """
+    Donor accepts or rejects a request.
+    If accepted -> donor profile updates: ever_donated=True, last_donation=today
+    """
+    status_value = request.data.get("status")
+    if status_value not in ("accepted", "rejected"):
+        return Response(
+            {"detail": 'Invalid status. Use "accepted" or "rejected".'},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    br = get_object_or_404(BloodRequest, id=request_id)
+
+    if br.donor != request.user:
+        return Response(
+            {"detail": "Only the donor can respond to this request."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    br.status = status_value
+    br.responded_at = timezone.now()
+    br.save()
+
+    # ✅ Auto update donor's profile if accepted
+    if status_value == "accepted":
+        try:
+            donor_profile = request.user.profile
+            donor_profile.ever_donated = True
+            donor_profile.last_donation = timezone.now().date()
+            donor_profile.save()
+        except Profile.DoesNotExist:
+            pass
+
+    return Response(BloodRequestSerializer(br, context={"request": request}).data)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def patient_requests(request):
-    qs = BloodRequest.objects.filter(requester=request.user).order_by('-requested_at')
-    return Response(BloodRequestSerializer(qs, many=True).data)
+    """
+    Patient views all requests they have sent.
+    """
+    qs = BloodRequest.objects.filter(requester=request.user).order_by("-requested_at")
+    serializer = BloodRequestSerializer(qs, many=True, context={"request": request})
+    return Response(serializer.data)
 
-# Admin dashboard stats
-@api_view(['GET'])
-@permission_classes([IsAuthenticated, IsAdmin])
+
+# ---------------------------
+# Admin statistics
+# ---------------------------
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
 def admin_stats(request):
-    total_donors = Profile.objects.filter(role='donor').count()
-    total_patients = Profile.objects.filter(role='patient').count()
-    requests_pending = BloodRequest.objects.filter(status='pending').count()
-    # available units by group -> count donors who can donate now by group
-    groups = {}
-    for g, _ in Profile._meta.get_field('blood_group').choices:
-        groups[g] = Profile.objects.filter(blood_group=g)
-    availability = {g: sum(1 for p in qs if p.can_donate_now()) for g, qs in groups.items()}
-    return Response({
-        'total_donors': total_donors,
-        'total_patients': total_patients,
-        'requests_pending': requests_pending,
-        'availability_by_group': availability,
-    })
+    if not request.user.is_staff:
+        return Response(
+            {"detail": "Admin only."}, status=status.HTTP_403_FORBIDDEN
+        )
+
+    donors_count = Profile.objects.filter(role="donor").count()
+    patients_count = Profile.objects.filter(role="patient").count()
+    pending_requests = BloodRequest.objects.filter(status="pending").count()
+
+    data = {
+        "donors": donors_count,
+        "patients": patients_count,
+        "pending_requests": pending_requests,
+    }
+    return Response(data)

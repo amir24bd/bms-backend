@@ -2,18 +2,21 @@
 from django.db import models
 from django.contrib.auth.models import User
 from django.utils import timezone
-from datetime import timedelta
+from datetime import timedelta, date
 
 BLOOD_GROUPS = [
-    ('A+', 'A+'),('A-','A-'),('B+','B+'),('B-','B-'),
-    ('O+','O+'),('O-','O-'),('AB+','AB+'),('AB-','AB-'),
+    ('A+', 'A+'), ('A-', 'A-'),
+    ('B+', 'B+'), ('B-', 'B-'),
+    ('O+', 'O+'), ('O-', 'O-'),
+    ('AB+', 'AB+'), ('AB-', 'AB-'),
 ]
 
 ROLE_CHOICES = [
-    ('donor','Donor'),
-    ('patient','Patient'),
-    ('admin','Admin'),  # admin role is optional; admin users should be staff
+    ('donor', 'Donor'),
+    ('patient', 'Patient'),
+    ('admin', 'Admin'),  # admin role is optional; admin users should be staff
 ]
+
 
 class Profile(models.Model):
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='profile')
@@ -21,6 +24,7 @@ class Profile(models.Model):
     blood_group = models.CharField(max_length=3, choices=BLOOD_GROUPS)
     city = models.CharField(max_length=100)
     role = models.CharField(max_length=10, choices=ROLE_CHOICES, default='patient')
+
     # donor-specific
     ever_donated = models.BooleanField(default=False)
     last_donation = models.DateField(null=True, blank=True)
@@ -30,7 +34,7 @@ class Profile(models.Model):
 
     def can_donate_now(self):
         """
-        A donor can donate if either never donated OR last_donation >= 90 days ago.
+        Donor can donate if never donated OR 90 days have passed since last_donation.
         """
         if not self.ever_donated or not self.last_donation:
             return True
@@ -38,22 +42,35 @@ class Profile(models.Model):
         return timezone.now().date() >= next_possible
 
     def next_possible_donation_date(self):
+        """
+        Returns date when the donor can donate next (90 days after last donation).
+        """
         if not self.last_donation:
             return None
         return self.last_donation + timedelta(days=90)
 
+    # ✅ Added: a clean alias so serializer can access it easily
+    def next_donation_date(self):
+        """Alias for next_possible_donation_date (for serializer compatibility)."""
+        return self.next_possible_donation_date()
+
     def __str__(self):
         return f"{self.name} ({self.blood_group})"
-    
+
 
 class BloodRequest(models.Model):
     STATUS_CHOICES = [
-        ('pending','Pending'),
-        ('accepted','Accepted'),
-        ('rejected','Rejected'),
+        ('pending', 'Pending'),
+        ('accepted', 'Accepted'),
+        ('rejected', 'Rejected'),
     ]
-    requester = models.ForeignKey(User, related_name='requests_made', on_delete=models.CASCADE)  # patient
-    donor = models.ForeignKey(User, related_name='requests_received', on_delete=models.CASCADE)   # donor user
+
+    requester = models.ForeignKey(
+        User, related_name='requests_made', on_delete=models.CASCADE
+    )  # patient
+    donor = models.ForeignKey(
+        User, related_name='requests_received', on_delete=models.CASCADE
+    )  # donor user
     message = models.TextField(blank=True)
     status = models.CharField(max_length=10, choices=STATUS_CHOICES, default='pending')
     requested_at = models.DateTimeField(auto_now_add=True)
